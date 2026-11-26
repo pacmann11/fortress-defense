@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0">
+		<title>Tower Defense</title>
+		<style>
+html, body, #canvas {
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+body {
+	color: white;
+	background-color: black;
+	overflow: hidden;
+	touch-action: none;
+}
+
+#canvas {
+	display: block;
+}
+
+#canvas:focus {
+	outline: none;
+}
+
+#status, #status-splash, #status-progress {
+	position: absolute;
+	left: 0;
+	right: 0;
+}
+
+#status, #status-splash {
+	top: 0;
+	bottom: 0;
+}
+
+#status {
+	background-color: #0f1230;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	align-items: center;
+	visibility: hidden;
+}
+
+#status-splash {
+	max-height: 100%;
+	max-width: 100%;
+	margin: auto;
+}
+
+#status-splash.show-image--false {
+	display: none;
+}
+
+#status-splash.fullsize--true {
+	height: 100%;
+	width: 100%;
+	object-fit: contain;
+}
+
+#status-splash.use-filter--false {
+	image-rendering: pixelated;
+}
+
+#status-progress, #status-notice {
+	display: none;
+}
+
+#status-progress {
+	bottom: 10%;
+	width: 50%;
+	margin: 0 auto;
+}
+
+#status-notice {
+	background-color: #5b3943;
+	border-radius: 0.5rem;
+	border: 1px solid #9b3943;
+	color: #e0e0e0;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	line-height: 1.3;
+	margin: 0 2rem;
+	overflow: hidden;
+	padding: 1rem;
+	text-align: center;
+	z-index: 1;
+}
+		</style>
+		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
+<link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
+<meta name='theme-color' content='#0f1230'>
+<style>
+html, body { background-color: #0f1230; overflow: hidden; overscroll-behavior: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+#canvas { position: fixed; top: 0; left: 0; transform-origin: 0 0; }
+/* Вертикальный экран (Telegram, MAX, VK, телефон): пока игра грузится, вместо широкой заставки
+   с полосами сверху и снизу — вертикальная обложка на языке игры (tools/paint_cover_portrait.py,
+   рядом с игрой её кладёт tools/deploy_web.sh). Потом игра рисуется боком, как и раньше. */
+@media (orientation: portrait) {
+	#status { background: #0f1230 url('index.cover-ru.webp') center / cover no-repeat; }
+	html[lang='en'] #status { background-image: url('index.cover-en.webp'); }
+	#status-splash { visibility: hidden; }
+}
+</style>
+<script>
+(function () {
+	// Язык. В мессенджере берём язык, который площадка сообщила об игроке: VK передаёт его
+	// в адресе (vk_language), Telegram и MAX — в данных запуска (user.language_code). Игра читает
+	// window.__platformLang (Lang.system_default) вместо языка браузера; язык, выбранный игроком
+	// в настройках, по-прежнему главнее. Нет данных площадки — язык браузера, как раньше.
+	// Правило то же, что в игре: русский для ru, иначе английский. Данные никуда не отправляются.
+	var platformLang = (function () {
+		var pick = function (code) { code = String(code || '').toLowerCase(); return code ? (code.indexOf('ru') === 0 ? 'ru' : 'en') : ''; };
+		var userLang = function (data) {
+			var tries = [data];
+			try { tries.push(decodeURIComponent(data)); } catch (e) {}
+			for (var i = 0; i < tries.length; i++) {
+				try {
+					var u = JSON.parse(new URLSearchParams(tries[i]).get('user') || 'null');
+					if (u && u.language_code) { return u.language_code; }
+				} catch (e) {}
+			}
+			return '';
+		};
+		try {
+			var vk = new URLSearchParams(location.search).get('vk_language');
+			if (vk) { return pick(vk); }
+			var h = new URLSearchParams((location.hash || '').replace(/^#/, ''));
+			var data = h.get('tgWebAppData') || h.get('WebAppData');
+			if (!data) {
+				// после перезагрузки внутри Telegram хеша может не быть: данные запуска лежат там,
+				// куда их сохранил скрипт Telegram
+				try { data = (JSON.parse(sessionStorage.getItem('__telegram__initParams') || 'null') || {}).tgWebAppData; } catch (e) {}
+			}
+			return data ? pick(userLang(data)) : '';
+		} catch (e) { return ''; }
+	})();
+	window.__platformLang = platformLang;
+	var ru = platformLang ? platformLang === 'ru' : (navigator.language || '').toLowerCase().indexOf('ru') === 0;
+	document.documentElement.lang = ru ? 'ru' : 'en';
+	document.title = ru ? 'Оборона Крепости' : 'Fortress Defense';
+	// Поворот. Игра горизонтальная. Если телефон держат вертикально, а система экран не
+	// поворачивает (блокировка поворота, MAX без поворота), игра рисуется боком: игрок
+	// поворачивает телефон — и она стоит ровно. Раньше тут была надпись «Поверните телефон»,
+	// и при блокировке поворота она не уходила никогда. Размер холста задаём сами
+	// (canvas_resize_policy=0), касания пересчитываем в координаты повёрнутого холста —
+	// движок о повороте не знает.
+	var rot = false, vw = 0;
+	var touchDevice = function () {
+		return (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) || navigator.maxTouchPoints > 0;
+	};
+	var devicePortrait = function () {
+		var o = window.screen && window.screen.orientation;
+		if (o && o.type) { return o.type.indexOf('portrait') === 0; }
+		if (typeof window.orientation === 'number') { return window.orientation % 180 === 0; }
+		return true;
+	};
+	var layout = function () {
+		var c = document.getElementById('canvas');
+		if (!c) { return; }
+		var w = window.innerWidth, h = window.innerHeight;
+		rot = h > w && touchDevice() && devicePortrait();
+		vw = w;
+		var cw = rot ? h : w, ch = rot ? w : h, dpr = window.devicePixelRatio || 1;
+		c.style.width = cw + 'px';
+		c.style.height = ch + 'px';
+		c.style.left = rot ? w + 'px' : '0px';
+		c.style.transform = rot ? 'rotate(90deg)' : 'none';
+		var pw = Math.floor(cw * dpr), ph = Math.floor(ch * dpr);
+		if (c.width !== pw) { c.width = pw; }
+		if (c.height !== ph) { c.height = ph; }
+		window.__rotated = rot;
+	};
+	// точка экрана -> точка холста: холст стоит в (vw, 0) и повёрнут на 90° по часовой
+	var map = function (x, y) { return rot ? [y, vw - x] : [x, y]; };
+	var wrapTouch = function (fn) {
+		return function (e) {
+			if (!rot) { return fn.call(this, e); }
+			var list = [];
+			for (var i = 0; i < e.changedTouches.length; i++) {
+				var t = e.changedTouches[i], p = map(t.clientX, t.clientY);
+				list.push({ identifier: t.identifier, clientX: p[0], clientY: p[1] });
+			}
+			return fn.call(this, { type: e.type, target: e.target, changedTouches: list, cancelable: e.cancelable,
+				preventDefault: function () { e.preventDefault(); }, stopPropagation: function () { e.stopPropagation(); } });
+		};
+	};
+	var wrapPointer = function (fn) {
+		return function (e) {
+			if (!rot) { return fn.call(this, e); }
+			var p = map(e.clientX, e.clientY);
+			return fn.call(this, new Proxy(e, { get: function (t, k) {
+				if (k === 'clientX') { return p[0]; }
+				if (k === 'clientY') { return p[1]; }
+				if (k === 'movementX') { return t.movementY || 0; }
+				if (k === 'movementY') { return -(t.movementX || 0); }
+				var v = t[k];
+				return typeof v === 'function' ? v.bind(t) : v;
+			} }));
+		};
+	};
+	var TOUCH = { touchstart: 1, touchmove: 1, touchend: 1, touchcancel: 1 };
+	var POINTER = { mousedown: 1, mouseup: 1, pointermove: 1 };
+	var patch = function (obj, pick) {
+		var add = obj.addEventListener, remove = obj.removeEventListener, made = new WeakMap();
+		obj.addEventListener = function (type, fn, opt) {
+			var wrap = typeof fn === 'function' ? pick(this, type) : null;
+			if (wrap) {
+				var g = made.get(fn);
+				if (!g) { g = wrap(fn); made.set(fn, g); }
+				fn = g;
+			}
+			return add.call(this, type, fn, opt);
+		};
+		obj.removeEventListener = function (type, fn, opt) {
+			var g = typeof fn === 'function' && pick(this, type) ? made.get(fn) : null;
+			return remove.call(this, type, g || fn, opt);
+		};
+	};
+	patch(HTMLCanvasElement.prototype, function (el, type) {
+		if (el.id !== 'canvas') { return null; }
+		return TOUCH[type] ? wrapTouch : (POINTER[type] ? wrapPointer : null);
+	});
+	patch(window, function (w, type) { return POINTER[type] ? wrapPointer : null; });
+	var rectOf = Element.prototype.getBoundingClientRect;
+	HTMLCanvasElement.prototype.getBoundingClientRect = function () {
+		if (rot && this.id === 'canvas') {
+			var w = parseFloat(this.style.width), h = parseFloat(this.style.height);
+			return { x: 0, y: 0, left: 0, top: 0, right: w, bottom: h, width: w, height: h };
+		}
+		return rectOf.call(this);
+	};
+	var later = function () { layout(); setTimeout(layout, 250); setTimeout(layout, 800); };
+	window.addEventListener('resize', layout);
+	window.addEventListener('orientationchange', later);
+	if (window.screen && window.screen.orientation && window.screen.orientation.addEventListener) {
+		window.screen.orientation.addEventListener('change', later);
+	}
+	document.addEventListener('DOMContentLoaded', layout);
+	var inMax = false;
+	// Где запущена игра. Telegram кладёт данные запуска в хеш адреса (#tgWebAppData=…), MAX — тоже
+	// в хеш (#WebAppData=…; это часть телеграмного ключа, поэтому Telegram проверяем первым),
+	// VK передаёт параметры vk_… в адресе страницы. Мост каждой площадки грузим только там.
+	var launchHash = location.hash || '', launchQuery = location.search || '';
+	// после перезагрузки внутри Telegram хеша может не быть: тогда узнаём по мосту приложения
+	// Telegram или по данным запуска, которые скрипт Telegram сохранил в sessionStorage
+	var tgSession = function () { try { return (sessionStorage.getItem('__telegram__initParams') || '').indexOf('tgWebAppData') >= 0; } catch (e) { return false; } };
+	var inTg = launchHash.indexOf('tgWebAppData=') >= 0 || launchHash.indexOf('tgWebAppPlatform=') >= 0 || !!window.TelegramWebviewProxy || tgSession();
+	var inVk = !inTg && (launchQuery.indexOf('vk_app_id=') >= 0 || launchQuery.indexOf('vk_platform=') >= 0);
+	var launchedInMax = !inTg && !inVk && (launchHash.indexOf('WebAppData=') >= 0 || !!window.WebViewHandler);
+	var safe = function (f) { try { var p = f(); if (p && p.catch) { p.catch(function () {}); } } catch (e) {} };
+	var load = function (src, done, fail) {
+		var s = document.createElement('script');
+		s.src = src; s.async = true; s.onload = done; s.onerror = fail;
+		(document.head || document.documentElement).appendChild(s);
+	};
+	// Сохранение игры (SaveData). Движок держит его в IndexedDB, но в мессенджере оно может
+	// не пережить закрытие мини-приложения. Поэтому копия лежит ещё в localStorage и в
+	// хранилище площадки: MAX — DeviceStorage на телефоне, Telegram — CloudStorage, VK —
+	// хранилище VK (VKWebAppStorage). Игра при запуске берёт копию с самым большим номером
+	// записи и ждёт ответа площадки, пока maxDone не станет true. Поля max/maxDone читает
+	// save_data.gd; имя осталось от MAX, теперь это копия любой площадки.
+	var SAVE_KEY = 'fortress_defense_save';
+	var remoteSet = null;   // запись копии на площадке; появляется, когда площадка ответила
+	window.__save = {
+		max: null,
+		maxDone: !(launchedInMax || inTg || inVk),
+		read: false, readRev: 0,
+		// игра читает копии один раз при запуске (save_data.gd: load_data) — запоминаем, с каким номером
+		local: function () {
+			var t = null;
+			try { t = localStorage.getItem(SAVE_KEY); } catch (e) {}
+			this.read = true;
+			this.readRev = Math.max(this.rev(t), this.rev(this.max));
+			return t;
+		},
+		rev: function (text) { try { return (JSON.parse(text || 'null') || {}).rev || 0; } catch (e) { return 0; } },
+		put: function (text) {
+			try { localStorage.setItem(SAVE_KEY, text); } catch (e) {}
+			// копию на площадке с большим номером не затираем: так бывает, если площадка ответила
+			// позже, чем игра стартовала, и она начала с чистого листа (при следующем запуске
+			// игра возьмёт копию площадки)
+			if (remoteSet && this.rev(text) >= this.rev(this.max)) {
+				var sent = false;
+				try { var p = remoteSet(text); sent = p !== false; if (p && p.catch) { p.catch(function () {}); } } catch (e) {}
+				if (sent) { this.max = text; }
+			}
+			return true;
+		}
+	};
+	// площадка ответила: value — её копия сохранения (или пусто), set — как писать туда дальше
+	// (null — не писать: например, площадка вернула ошибку и мы не знаем, что там лежит).
+	// Если ответ пришёл, когда игра уже стартовала без него, а в копии площадки прогресс больше,
+	// в эту сессию площадку не трогаем: иначе свежая игра со временем затрёт её (например, облако
+	// Telegram с прогрессом с телефона). При следующем запуске игра возьмёт копию площадки.
+	var remoteReady = function (value, set) {
+		var s = window.__save;
+		if (s.maxDone && remoteSet) { return; }
+		var v = typeof value === 'string' && value ? value : null;
+		if (s.read && s.rev(v) > s.readRev) { set = null; }
+		s.max = v;
+		remoteSet = set || null;
+		s.maxDone = true;
+	};
+	var timedOut = function (err) { try { return JSON.stringify(err).indexOf('timeout') >= 0; } catch (e) { return false; } };
+	// мост MAX: готовность, горизонтальная ориентация, без закрытия свайпом вниз, копия сохранения
+	window.__maxBridge = function () {
+		var w = window.WebApp;
+		if (inMax || inTg || inVk) { return; }
+		if (!w || !w.initData) { remoteReady(null, null); return; }
+		inMax = true;
+		safe(function () { return w.ready(); });
+		safe(function () { return w.lockOrientation('landscape'); });
+		safe(function () { return w.disableVerticalSwipes(); });
+		var set = w.DeviceStorage ? function (text) { return w.DeviceStorage.setItem(SAVE_KEY, text); } : null;
+		try {
+			w.DeviceStorage.getItem(SAVE_KEY).then(function (r) {
+				remoteReady(r && typeof r.value === 'string' ? r.value : null, set);
+			}, function (err) { remoteReady(null, timedOut(err) ? null : set); });
+		} catch (e) { remoteReady(null, set); }
+	};
+	// мост Telegram: готовность, во всю высоту, без закрытия свайпом вниз, цвет шапки,
+	// копия сохранения в CloudStorage (до 4096 символов на запись — нашему сохранению хватает)
+	var tgPost = function (type) {
+		// запасной путь, если скрипт telegram.org не загрузился: те же сообщения, что шлёт он сам
+		try {
+			if (window.TelegramWebviewProxy) { window.TelegramWebviewProxy.postEvent(type, JSON.stringify('')); }
+			else if (window.parent && window.parent !== window) { window.parent.postMessage(JSON.stringify({ eventType: type, eventData: '' }), '*'); }
+		} catch (e) {}
+	};
+	var tgSignalled = false;
+	var tgSignal = function () {
+		if (tgSignalled) { return; }
+		tgSignalled = true;
+		tgPost('web_app_ready');
+		tgPost('web_app_expand');
+	};
+	var startTg = function () {
+		var tg = window.Telegram && window.Telegram.WebApp;
+		if (!tg || !tg.isVersionAtLeast) { tgSignal(); remoteReady(null, null); return; }
+		tgSignalled = true;
+		safe(function () { return tg.ready(); });
+		safe(function () { return tg.expand(); });
+		if (tg.isVersionAtLeast('6.9')) {
+			safe(function () { return tg.setHeaderColor('#0f1230'); });
+			safe(function () { return tg.setBackgroundColor('#0f1230'); });
+		}
+		if (tg.isVersionAtLeast('7.7')) { safe(function () { return tg.disableVerticalSwipes(); }); }
+		if (!tg.isVersionAtLeast('6.9') || !tg.CloudStorage) { remoteReady(null, null); return; }
+		var set = function (text) {
+			if (text.length > 4096) { return false; }
+			tg.CloudStorage.setItem(SAVE_KEY, text, function () {});
+		};
+		try {
+			tg.CloudStorage.getItem(SAVE_KEY, function (err, value) { remoteReady(err ? null : value, err ? null : set); });
+		} catch (e) { remoteReady(null, null); }
+	};
+	// мост VK: сигнал запуска VKWebAppInit (без него VK игру не покажет) и копия сохранения
+	// в хранилище VK (до 4096 байт на запись)
+	var vkInitSent = false;
+	var vkInitRaw = function () {
+		// запасной путь, если мост VK не загрузился (или грузится слишком долго): сигнал запуска напрямую
+		if (vkInitSent) { return; }
+		vkInitSent = true;
+		try {
+			if (window.AndroidBridge && window.AndroidBridge.VKWebAppInit) { window.AndroidBridge.VKWebAppInit('{}'); }
+			else if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.VKWebAppInit) { window.webkit.messageHandlers.VKWebAppInit.postMessage({}); }
+			else if (window.parent && window.parent !== window) { window.parent.postMessage({ handler: 'VKWebAppInit', params: {}, type: 'vk-connect' }, '*'); }
+		} catch (e) {}
+	};
+	var startVk = function () {
+		var b = window.vkBridge;
+		if (!b || !b.send) { vkInitRaw(); remoteReady(null, null); return; }
+		if (!vkInitSent) { vkInitSent = true; safe(function () { return b.send('VKWebAppInit'); }); }
+		var set = function (text) {
+			if (unescape(encodeURIComponent(text)).length > 4096) { return false; }
+			return b.send('VKWebAppStorageSet', { key: SAVE_KEY, value: text });
+		};
+		try {
+			b.send('VKWebAppStorageGet', { keys: [SAVE_KEY] }).then(function (r) {
+				var k = r && r.keys && r.keys[0];
+				remoteReady(k && k.key === SAVE_KEY ? k.value : null, set);
+			}, function () { remoteReady(null, null); });
+		} catch (e) { remoteReady(null, null); }
+	};
+	var VK_BRIDGE = '@vkontakte/vk-bridge@3.0.2/dist/browser.min.js';
+	// скрипт площадки может зависнуть, а не упасть с ошибкой (медленная сеть, замедление):
+	// сигнал готовности не ждёт его дольше 2,5 с — без него VK игру не покажет
+	if (inTg) {
+		load('https://telegram.org/js/telegram-web-app.js', startTg, startTg);
+		setTimeout(tgSignal, 2500);
+	} else if (inVk) {
+		load('https://cdn.jsdelivr.net/npm/' + VK_BRIDGE, startVk, function () {
+			load('https://unpkg.com/' + VK_BRIDGE, startVk, startVk);
+		});
+		setTimeout(vkInitRaw, 2500);
+	} else {
+		load('https://st.max.ru/js/max-web-app.js', function () { window.__maxBridge(); }, function () {
+			window.__maxBridgeFailed = true;
+			remoteReady(null, null);
+		});
+		if (window.WebApp) { window.__maxBridge(); }
+	}
+	// обычный браузер (Android): по первому касанию — полный экран и горизонталь
+	var tryFullscreen = function () {
+		if (inMax || inTg || inVk || window.WebApp && window.WebApp.initData) { window.removeEventListener('touchend', tryFullscreen, true); return; }
+		var el = document.documentElement;
+		if (!document.fullscreenEnabled || document.fullscreenElement || !el.requestFullscreen) { return; }
+		el.requestFullscreen({ navigationUI: 'hide' }).then(function () {
+			window.removeEventListener('touchend', tryFullscreen, true);
+			if (screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); }
+		}).catch(function () {});
+	};
+	window.addEventListener('touchend', tryFullscreen, true);
+	// счётчик кадров для проверки на телефоне: адрес с ?fps
+	if (/[?&]fps(=|&|$)/.test(location.search)) {
+		window.__fpsLog = [];
+		document.addEventListener('DOMContentLoaded', function () {
+			var el = document.createElement('div');
+			el.style.cssText = 'position:fixed;left:4px;bottom:4px;z-index:20;font:12px monospace;color:#fff;background:rgba(0,0,0,0.6);padding:2px 6px;pointer-events:none';
+			document.body.appendChild(el);
+			var last = performance.now(), n = 0, worst = 0, t0 = last;
+			var tick = function (now) {
+				var d = now - last; last = now; n++; if (d > worst) { worst = d; }
+				if (now - t0 >= 1000) {
+					var fps = Math.round(n * 1000 / (now - t0));
+					el.textContent = fps + ' fps, max ' + Math.round(worst) + ' ms';
+					window.__fpsLog.push([fps, Math.round(worst)]);
+					n = 0; worst = 0; t0 = now;
+				}
+				requestAnimationFrame(tick);
+			};
+			requestAnimationFrame(tick);
+		});
+	}
+})();
+</script>
+<script>
+(function () {
+	// Счётчик посещений веб-версии: Яндекс Метрика, счётчик 114676614.
+	// Площадку узнаём по данным запуска: Telegram кладёт их в хеш адреса (#tgWebAppData=),
+	// MAX тоже в хеш (#WebAppData=), VK передаёт параметры vk_ в адресе. ?src=имя задаёт площадку вручную.
+	// В Метрику уходит адрес страницы без хеша и параметров: в них данные профиля игрока.
+	var counterId = 114676614, gameId = 'fortress-defense';
+	var launchHash = location.hash || '', launchQuery = location.search || '', platform = 'web';
+	if (launchHash.indexOf('tgWebAppData=') >= 0 || launchHash.indexOf('tgWebAppPlatform=') >= 0) { platform = 'telegram'; }
+	else if (launchHash.indexOf('WebAppData=') >= 0) { platform = 'max'; }
+	else if (launchQuery.indexOf('vk_app_id=') >= 0 || launchQuery.indexOf('vk_platform=') >= 0) { platform = 'vk'; }
+	else if (window.WebViewHandler || (document.referrer || '').indexOf('max.ru') >= 0) { platform = 'max'; }
+	var forced = launchQuery.match(/[?&]src=([a-z0-9_-]{1,20})/i);
+	if (forced) { platform = forced[1].toLowerCase(); }
+	window.__platform = platform;
+	(function(m,e,t,r,i,k,a){m[i]=m[i]||function(){(m[i].a=m[i].a||[]).push(arguments)};m[i].l=1*new Date();for (var j = 0; j < document.scripts.length; j++) {if (document.scripts[j].src === r) { return; }}k=e.createElement(t),a=e.getElementsByTagName(t)[0],k.async=1,k.src=r,a.parentNode.insertBefore(k,a)})(window, document, 'script', 'https://mc.yandex.ru/metrika/tag.js?id=' + counterId, 'ym');
+	window.ym(counterId, 'init', {ssr: true, clickmap: false, trackLinks: false, accurateTrackBounce: true, webvisor: false, url: location.origin + location.pathname, referrer: document.referrer, params: {platform: platform, game: gameId}});
+	// Посетители и игроки. Посетитель — сам визит (выше). Дальше параметр визита act → площадка →
+	// стадия: loaded — игра загрузилась и видна (Godot убрал экран загрузки #status); active —
+	// игрок начал играть: 3 касания или щелчка по игре после загрузки. Пассивные = посетители
+	// без active. Отправляется только площадка и стадия, никаких данных игрока.
+	var sent = {}, seen = false, loadedAt = 0, taps = 0;
+	var mark = function (stage) {
+		if (sent[stage]) { return; }
+		sent[stage] = 1;
+		var p = {};
+		p[platform] = stage;
+		window.ym(counterId, 'params', {act: p});
+	};
+	var poll = setInterval(function () {
+		var s = document.getElementById('status');
+		seen = seen || !!s;
+		if (seen && (!s || getComputedStyle(s).display === 'none')) { clearInterval(poll); loadedAt = Date.now(); mark('loaded'); }
+	}, 400);
+	// экран загрузки есть в странице к DOMContentLoaded, а убирается движком позже — так повторный
+	// заход из кеша, где игра стартует быстрее первой проверки, тоже засчитывается
+	document.addEventListener('DOMContentLoaded', function () { seen = seen || !!document.getElementById('status'); });
+	var tap = function () {
+		if (!loadedAt) { return; }
+		taps++;
+		if (taps >= 3) { mark('active'); window.removeEventListener('pointerdown', tap, true); }
+	};
+	window.addEventListener('pointerdown', tap, true);
+})();
+</script>
+	</head>
+	<body>
+		<canvas id="canvas">
+			Your browser does not support the canvas tag.
+		</canvas>
+
+		<noscript>
+			Your browser does not support JavaScript.
+		</noscript>
+
+		<div id="status">
+			<img id="status-splash" class="show-image--true fullsize--true use-filter--true" src="index.png" alt="">
+			<progress id="status-progress"></progress>
+			<div id="status-notice"></div>
+		</div>
+
+		<script src="index.js"></script>
+		<script>
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":0,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":7571032,"index.wasm":21510983},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_THREADS_ENABLED = false;
+const engine = new Engine(GODOT_CONFIG);
+
+(function () {
+	const statusOverlay = document.getElementById('status');
+	const statusProgress = document.getElementById('status-progress');
+	const statusNotice = document.getElementById('status-notice');
+
+	let initializing = true;
+	let statusMode = '';
+
+	function setStatusMode(mode) {
+		if (statusMode === mode || !initializing) {
+			return;
+		}
+		if (mode === 'hidden') {
+			statusOverlay.remove();
+			initializing = false;
+			return;
+		}
+		statusOverlay.style.visibility = 'visible';
+		statusProgress.style.display = mode === 'progress' ? 'block' : 'none';
+		statusNotice.style.display = mode === 'notice' ? 'block' : 'none';
+		statusMode = mode;
+	}
+
+	function setStatusNotice(text) {
+		while (statusNotice.lastChild) {
+			statusNotice.removeChild(statusNotice.lastChild);
+		}
+		const lines = text.split('\n');
+		lines.forEach((line) => {
+			statusNotice.appendChild(document.createTextNode(line));
+			statusNotice.appendChild(document.createElement('br'));
+		});
+	}
+
+	function displayFailureNotice(err) {
+		console.error(err);
+		if (err instanceof Error) {
+			setStatusNotice(err.message);
+		} else if (typeof err === 'string') {
+			setStatusNotice(err);
+		} else {
+			setStatusNotice('An unknown error occurred.');
+		}
+		setStatusMode('notice');
+		initializing = false;
+	}
+
+	const missing = Engine.getMissingFeatures({
+		threads: GODOT_THREADS_ENABLED,
+	});
+
+	if (missing.length !== 0) {
+		if (GODOT_CONFIG['serviceWorker'] && GODOT_CONFIG['ensureCrossOriginIsolationHeaders'] && 'serviceWorker' in navigator) {
+			let serviceWorkerRegistrationPromise;
+			try {
+				serviceWorkerRegistrationPromise = navigator.serviceWorker.getRegistration();
+			} catch (err) {
+				serviceWorkerRegistrationPromise = Promise.reject(new Error('Service worker registration failed.'));
+			}
+			// There's a chance that installing the service worker would fix the issue
+			Promise.race([
+				serviceWorkerRegistrationPromise.then((registration) => {
+					if (registration != null) {
+						return Promise.reject(new Error('Service worker already exists.'));
+					}
+					return registration;
+				}).then(() => engine.installServiceWorker()),
+				// For some reason, `getRegistration()` can stall
+				new Promise((resolve) => {
+					setTimeout(() => resolve(), 2000);
+				}),
+			]).then(() => {
+				// Reload if there was no error.
+				window.location.reload();
+			}).catch((err) => {
+				console.error('Error while registering service worker:', err);
+			});
+		} else {
+			// Display the message as usual
+			const missingMsg = 'Error\nThe following features required to run Godot projects on the Web are missing:\n';
+			displayFailureNotice(missingMsg + missing.join('\n'));
+		}
+	} else {
+		setStatusMode('progress');
+		engine.startGame({
+			'onProgress': function (current, total) {
+				if (current > 0 && total > 0) {
+					statusProgress.value = current;
+					statusProgress.max = total;
+				} else {
+					statusProgress.removeAttribute('value');
+					statusProgress.removeAttribute('max');
+				}
+			},
+		}).then(() => {
+			setStatusMode('hidden');
+		}, displayFailureNotice);
+	}
+}());
+		</script>
+	</body>
+</html>
+
